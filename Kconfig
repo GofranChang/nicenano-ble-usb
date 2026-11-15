@@ -1,0 +1,6 @@
+mainmenu "nice!nano BLE to USB HID bridge"
+source "Kconfig.zephyr"
+
+config BRIDGE_PEER_NAME
+    string "Exact advertising name allowed during first pairing (empty allows any HID)"
+    default "wenwan"

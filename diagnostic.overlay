@@ -1,0 +1,6 @@
+/ {
+    chosen { zephyr,console = &bridge_console; };
+};
+&usbd {
+    bridge_console: cdc_acm_uart0 { compatible = "zephyr,cdc-acm-uart"; };
+};

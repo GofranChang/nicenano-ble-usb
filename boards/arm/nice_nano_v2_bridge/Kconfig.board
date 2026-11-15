@@ -1,0 +1,3 @@
+config BOARD_NICE_NANO_V2_BRIDGE
+    bool "nice!nano v2 standalone BLE USB bridge"
+    depends on SOC_NRF52840_QIAA

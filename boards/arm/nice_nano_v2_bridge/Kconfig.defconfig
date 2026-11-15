@@ -1,0 +1,8 @@
+if BOARD_NICE_NANO_V2_BRIDGE
+config BOARD
+    default "nice_nano_v2_bridge"
+config USB_NRFX
+    default y if USB_DEVICE_STACK
+config BT_CTLR
+    default y if BT
+endif

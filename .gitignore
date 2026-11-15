@@ -1,0 +1,9 @@
+build/
+build-diagnostic/
+build-diagnostic.log
+build-cache/
+build.log
+firmware/
+__pycache__/
+.DS_Store
+*.elf
