@@ -1,0 +1,75 @@
+name: Build bridge firmware
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: nicenano-ble-usb
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler ninja-build
+          python -m pip install cmake==3.30.9
+      - name: Set up pinned Zephyr and SDK
+        uses: zephyrproject-rtos/action-zephyr-setup@v1
+        with:
+          app-path: nicenano-ble-usb
+          sdk-version: 0.16.8
+          west-version: 1.3.0
+          toolchains: arm-zephyr-eabi
+      - name: Test HID report parser
+        working-directory: nicenano-ble-usb
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g -I src tests/test_hid_map.c src/hid_map.c -o /tmp/test_hid_map
+          /tmp/test_hid_map tests/fixtures/wenwan-report-map-0.bin tests/fixtures/wenwan-report-map-1.bin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test web protocol
+        working-directory: nicenano-ble-usb
+        run: node --test tests/web-protocol.test.mjs
+      - name: Build XTAL web firmware
+        run: |
+          west build -b nice_nano_v2_bridge nicenano-ble-usb -d build -- -DEXTRA_CONF_FILE="${GITHUB_WORKSPACE}/nicenano-ble-usb/diagnostic.conf;${GITHUB_WORKSPACE}/nicenano-ble-usb/clock-xtal.conf" -DDTC_OVERLAY_FILE="${GITHUB_WORKSPACE}/nicenano-ble-usb/diagnostic.overlay"
+          mkdir -p artifacts/firmware
+          cp build/zephyr/zephyr.uf2 artifacts/firmware/nicenano-v8-web-xtal.uf2
+          cp build/zephyr/zephyr.elf artifacts/firmware/nicenano-v8-web-xtal.elf
+          cp build/zephyr/.config artifacts/firmware/build.config
+          cp -r nicenano-ble-usb/web artifacts/web
+          cp nicenano-ble-usb/README.md artifacts/
+          cd artifacts/firmware
+          sha256sum nicenano-v8-web-xtal.uf2 > SHA256SUMS
+      - name: Upload firmware and web console
+        uses: actions/upload-artifact@v4
+        with:
+          name: nicenano-web-console-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload build diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: |
+            build/zephyr/.config
+            build/CMakeFiles/CMakeOutput.log
+          if-no-files-found: ignore

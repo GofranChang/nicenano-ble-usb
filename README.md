@@ -8,6 +8,33 @@ wenwan 右手 → 左手主控 → 蓝牙 BLE → NRF52nano 接收器 → USB �
 
 本项目使用 Zephyr 在 nRF52840 上实现 HID 透传，参考 ESP32 项目的设计思路；不是直接编译 ESP-IDF 代码，也不是原生 ZMK 分体 central 接收器。
 
+## 网页管理端（v8-web）
+
+新网页位于 [`web/`](web/)。它通过 Web Serial 直接访问接收器的 USB CDC 串口，无服务器端程序、账号或云端数据传输。请使用 Chrome / Edge；Safari / Firefox 不支持此串口接口。
+
+1. 给接收器刷入 `firmware/nicenano-ble-usb-diagnostic-v8-web-xtal.uf2`。旧 v7 只有日志，不能执行管理命令。保留 `releases/v7/` 内的实测可用基线，便于回退。
+2. 在仓库目录运行 `python3 -m http.server 8857 --bind 127.0.0.1 --directory web`。
+3. 用 Chrome / Edge 打开 `http://127.0.0.1:8857`，点击“连接 USB 接收器”，选择对应串口。浏览器授权由用户操作。
+4. 页面可查看 BLE / USB 状态及报告计数、扫描附近 BLE HID 设备、连接选择的设备、断开、恢复自动连接和清除接收器绑定。清除前有二次确认。
+
+扫描持续 15 秒并暂停自动连接。关闭网页只释放管理串口，不主动断开键盘；若此前暂停了自动连接，该状态保持到恢复或接收器重启。当前只有一个绑定槽，更换设备时必须先断开并清除旧绑定。设备列表最多 12 项，显示本次上电以来发现的设备，重新扫描用于确认设备仍在广播。广播名显示不支持的字符会替换为 `?`。
+
+网页不会清除键盘自己的蓝牙槽或修改键位，也不读取按键内容。不能在其他串口终端占用设备时同时打开网页管理连接。选择报告格式不同的新设备可能触发一次 USB 重枚举，届时重新点击管理端连接即可。
+
+USB 管理协议为 UTF-8 行文本，命令以 `@` 开头、换行结束（最大 95 字节），响应以 `@bridge ` 开头，后接 JSON。支持 `@status`、`@devices`、`@scan`、`@connect N`、`@disconnect`、`@resume`、`@clear`。`@clear` 在断开后执行，不删除 USB 描述符缓存。广播名、RSSI、地址和状态只在本机页面显示。
+
+构建命令：`python3 build.py --diagnostic --xtal`。v8-web 已通过本机编译及协议单元测试；网页已做未连接状态的浏览器预览。实际串口双向控制、清除/重新连接流程还需刷入 v8 后验收，不能仅凭编译通过视作已实测。
+
+## GitHub Actions 自动构建
+
+[`.github/workflows/build.yml`](.github/workflows/build.yml) 在 push、pull request 和手动 Run workflow 时运行：
+
+- 固定 Zephyr manifest、SDK 0.16.8、west 1.3.0、Python 3.11 和 CMake 3.30.9。
+- 运行 ASan/UBSan HID 测试及 Node 网页协议测试。
+- 编译 v8-web XTAL 固件，上传 UF2、ELF、最终 `.config`、校验值及静态网页。
+
+在 GitHub 仓库的 **Actions → Build bridge firmware → 对应运行 → Artifacts** 下载 ZIP；固件在 `firmware/`，网页在 `web/`。工作流只读仓库权限，不自动发布 Release 或改动 Pages。
+
 ## 当前可用版本
 
 **v7 XTAL 是本次实机验证可打字的基线，请优先使用它。**

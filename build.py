@@ -51,7 +51,7 @@ if code:
     sys.exit(code)
 dest = app / 'firmware'
 dest.mkdir(exist_ok=True)
-stem='nicenano-ble-usb-diagnostic-v7' if args.diagnostic else 'nicenano-v2-ble-usb-wenwan'
+stem='nicenano-ble-usb-diagnostic-v8-web' if args.diagnostic else 'nicenano-v2-ble-usb-wenwan'
 if args.xtal: stem+='-xtal'
 shutil.copy2(build_dir / 'zephyr/zephyr.uf2', dest / (stem+'.uf2'))
 shutil.copy2(build_dir / 'zephyr/zephyr.elf', dest / (stem+'.elf'))

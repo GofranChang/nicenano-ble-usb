@@ -8,6 +8,9 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/hwinfo.h>
+#include <zephyr/drivers/uart.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
@@ -57,6 +60,11 @@ static atomic_t last_report_time;
 static atomic_t advertisements, target_hits;
 static atomic_t connected_at;
 static atomic_t stale_bond;
+static bool paused, clear_pending, resume_after_connect;
+static int64_t pairing_deadline, scan_deadline;
+struct seen_device { bt_addr_le_t addr; char name[33]; int8_t rssi; bool used; };
+static struct seen_device seen[12];
+static struct k_spinlock seen_lock;
 static K_SEM_DEFINE(link_event, 0, 1);
 static K_SEM_DEFINE(op_done, 0, 1);
 static K_SEM_DEFINE(usb_done, 0, 1);
@@ -480,6 +488,7 @@ static int setup_hid(void)
         if (err) return err;
     }
     atomic_set(&ready, 1);
+    if(resume_after_connect) { paused=false;resume_after_connect=false; }
     LOG_INF("HID ready: %u reports, %u-byte map", report_count, (unsigned)map_len);
     return 0;
 }
@@ -520,10 +529,18 @@ BT_CONN_CB_DEFINE(connection_callbacks)={
     .connected=connected, .disconnected=disconnected, .security_changed=security_changed,
 };
 
-struct advertisement { bool hid, name; };
+struct advertisement { bool hid, name; char label[33]; };
 static bool parse_ad(struct bt_data *ad, void *user)
 {
     struct advertisement *a=user;
+    if (ad->type==BT_DATA_NAME_COMPLETE || ad->type==BT_DATA_NAME_SHORTENED) {
+        unsigned n=MIN(ad->data_len,32);
+        for(unsigned i=0;i<n;i++) {
+            unsigned char c=ad->data[i];
+            a->label[i]=(c>=32 && c<127 && c!='"' && c!='\\') ? c : '?';
+        }
+        a->label[n]=0;
+    }
     if (ad->type==BT_DATA_UUID16_ALL || ad->type==BT_DATA_UUID16_SOME) {
         for (unsigned i=0; i+1<ad->data_len; i+=2)
             if (sys_get_le16(ad->data+i)==0x1812) a->hid=true;
@@ -537,6 +554,22 @@ static bool parse_ad(struct bt_data *ad, void *user)
 static void scan_found(const struct bt_le_scan_recv_info *info, struct net_buf_simple *ad)
 {
     atomic_inc(&advertisements);
+    struct advertisement observed={0};
+    bt_data_parse(ad, parse_ad, &observed);
+    if (observed.hid || observed.label[0]) {
+        k_spinlock_key_t key=k_spin_lock(&seen_lock);
+        int slot=-1;
+        for(unsigned i=0;i<ARRAY_SIZE(seen);i++) {
+            if (seen[i].used && !bt_addr_le_cmp(&seen[i].addr,info->addr)) { slot=i; break; }
+            if (!seen[i].used && slot<0) slot=i;
+        }
+        if(slot>=0 && (observed.hid || seen[slot].used)) {
+            seen[slot].used=true;seen[slot].addr=*info->addr;seen[slot].rssi=info->rssi;
+            if(observed.label[0]) memcpy(seen[slot].name,observed.label,sizeof(observed.label));
+        }
+        k_spin_unlock(&seen_lock,key);
+    }
+    if (paused) return;
     if (atomic_get(&selecting) || !(info->adv_props & (BT_GAP_ADV_PROP_CONNECTABLE |
                                    BT_GAP_ADV_PROP_SCAN_RESPONSE))) return;
     if (has_bond) {
@@ -566,6 +599,101 @@ static void clear_pairing(void)
     if (!err) err=settings_delete("bridge/map");
     if (err) LOG_ERR("Clear failed: %d", err);
     sys_reboot(SYS_REBOOT_COLD);
+}
+
+
+static void control_status(void)
+{
+    printk("@bridge {\"event\":\"status\",\"protocol\":1,\"version\":\"v8-web\",\"ble\":%d,\"usb\":%d,\"secure\":%d,\"bonded\":%d,\"paused\":%d,\"rx\":%ld,\"tx\":%ld,\"errors\":%ld}\n",
+           (int)atomic_get(&ready),(int)atomic_get(&usb_mounted),
+           (int)atomic_get(&secure),has_bond,paused,
+           (long)atomic_get(&ble_reports),(long)atomic_get(&usb_reports),(long)atomic_get(&usb_failures));
+}
+
+static void control_devices(void)
+{
+    struct seen_device snapshot[12];
+    k_spinlock_key_t key=k_spin_lock(&seen_lock);
+    memcpy(snapshot,seen,sizeof(snapshot));
+    k_spin_unlock(&seen_lock,key);
+    printk("@bridge {\"event\":\"devices_begin\"}\n");
+    for(unsigned i=0;i<ARRAY_SIZE(snapshot);i++) {
+        if(!snapshot[i].used) continue;
+        char addr[BT_ADDR_LE_STR_LEN];bt_addr_le_to_str(&snapshot[i].addr,addr,sizeof(addr));
+        printk("@bridge {\"event\":\"device\",\"index\":%u,\"name\":\"%s\",\"address\":\"%s\",\"rssi\":%d}\n",
+               i,snapshot[i].name,addr,snapshot[i].rssi);
+    }
+    printk("@bridge {\"event\":\"devices_end\"}\n");
+}
+
+static void control_error(const char *message)
+{
+    printk("@bridge {\"event\":\"error\",\"message\":\"%s\"}\n",message);
+}
+
+static void control_command(char *line)
+{
+    if(!strcmp(line,"@status")) { control_status();return; }
+    if(!strcmp(line,"@devices")) { control_devices();return; }
+    if(!strcmp(line,"@scan")) {
+        paused=true;scan_deadline=k_uptime_get()+15000;
+        int err=bt_le_scan_start(BT_LE_SCAN_ACTIVE,NULL);
+        if(err && err!=-EALREADY) { control_error("scan_failed");return; }
+        printk("@bridge {\"event\":\"scanning\",\"seconds\":15}\n");return;
+    }
+    if(!strcmp(line,"@disconnect") || !strcmp(line,"@clear")) {
+        paused=true;resume_after_connect=false;scan_deadline=0;bt_le_scan_stop();
+        k_msgq_purge(&candidate_queue);
+        if(!strcmp(line,"@clear")) clear_pending=true;
+        if(peer) bt_conn_disconnect(peer,BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        else atomic_clear(&selecting);
+        printk("@bridge {\"event\":\"accepted\"}\n");return;
+    }
+    if(!strcmp(line,"@resume")) {
+        if(clear_pending) { control_error("busy");return; }
+        paused=false;scan_deadline=0;pairing_deadline=k_uptime_get()+120000;
+        printk("@bridge {\"event\":\"resuming\"}\n");return;
+    }
+    if(!strncmp(line,"@connect ",9)) {
+        char *end;long index=strtol(line+9,&end,10);
+        if(end==line+9 || *end || index<0 || index>=ARRAY_SIZE(seen)) { control_error("invalid_index");return; }
+        if(peer || clear_pending) { control_error("disconnect_first");return; }
+        struct seen_device target;
+        k_spinlock_key_t key=k_spin_lock(&seen_lock);target=seen[index];k_spin_unlock(&seen_lock,key);
+        if(!target.used) { control_error("device_not_found");return; }
+        if(has_bond && bt_addr_le_cmp(&target.addr,&bonded_addr)) { control_error("clear_binding_first");return; }
+        paused=true;resume_after_connect=true;scan_deadline=0;bt_le_scan_stop();
+        k_msgq_purge(&candidate_queue);atomic_set(&selecting,1);
+        if(k_msgq_put(&candidate_queue,&target.addr,K_NO_WAIT)) { atomic_clear(&selecting);control_error("busy");return; }
+        printk("@bridge {\"event\":\"connecting\"}\n");return;
+    }
+    control_error("unknown_command");
+}
+
+static void control_poll(void)
+{
+#if DT_HAS_CHOSEN(zephyr_console)
+    const struct device *uart=DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+    static char line[96];static unsigned used;static bool overflow;
+    unsigned char c;
+    for(unsigned n=0;n<128 && !uart_poll_in(uart,&c);n++) {
+        if(c=='\r') continue;
+        if(c=='\n') {
+            if(overflow) control_error("command_too_long");
+            else if(used) { line[used]=0;control_command(line); }
+            used=0;overflow=false;
+        } else if(used<sizeof(line)-1 && !overflow) line[used++]=c;
+        else overflow=true;
+    }
+    if(scan_deadline && k_uptime_get()>scan_deadline) { scan_deadline=0;bt_le_scan_stop(); }
+    if(clear_pending && !peer) {
+        int err=bt_unpair(BT_ID_DEFAULT,BT_ADDR_LE_ANY);
+        has_bond=false;bt_foreach_bond(BT_ID_DEFAULT,bond_found,NULL);
+        atomic_clear(&stale_bond);atomic_clear(&selecting);clear_pending=false;
+        if(err) control_error("clear_failed");
+        else printk("@bridge {\"event\":\"cleared\"}\n");
+    }
+#endif
 }
 
 static void poll_button_led(void)
@@ -617,7 +745,7 @@ int main(void)
         if (hid_map_parse(report_map, map_len, &map_info)) return 0;
     }
     if ((err=start_usb())) { LOG_ERR("USB init %d", err); return 0; }
-    LOG_INF("Bridge v7 starting; expected peer name '%s'", CONFIG_BRIDGE_PEER_NAME);
+    LOG_INF("Bridge v8-web starting; expected peer name '%s'", CONFIG_BRIDGE_PEER_NAME);
     uint32_t reset_cause=0;
     if (!hwinfo_get_reset_cause(&reset_cause)) {
         LOG_INF("Reset cause mask=%08x", reset_cause);
@@ -640,9 +768,10 @@ int main(void)
     bt_foreach_bond(BT_ID_DEFAULT, bond_found, NULL);
     bt_le_scan_cb_register(&scan_callbacks);
     LOG_INF("Bluetooth initialized; stored bond=%u", has_bond);
-    int64_t pairing_deadline=k_uptime_get()+120000;
+    pairing_deadline=k_uptime_get()+120000;
     while (true) {
         poll_button_led();
+        control_poll();
         if (!peer) {
             bt_addr_le_t candidate;
             if (!k_msgq_get(&candidate_queue, &candidate, K_NO_WAIT)) {
@@ -652,6 +781,7 @@ int main(void)
                 if (err) { LOG_ERR("Create connection: %d", err); atomic_clear(&selecting); }
                 continue;
             }
+            if(paused) { k_sleep(K_MSEC(20));continue; }
             if (!has_bond && k_uptime_get()>pairing_deadline) {
                 /* Replug for another first-pairing window; avoid indefinite discovery. */
                 bt_le_scan_stop(); k_sleep(K_MSEC(50)); continue;
