@@ -12,7 +12,7 @@ wenwan 右手 → 左手主控 → 蓝牙 BLE → NRF52nano 接收器 → USB �
 
 新网页位于 [`web/`](web/)。它通过 Web Serial 直接访问接收器的 USB CDC 串口，无服务器端程序、账号或云端数据传输。请使用 Chrome / Edge；Safari / Firefox 不支持此串口接口。
 
-1. 给接收器刷入 `firmware/nicenano-ble-usb-diagnostic-v8.1-web-xtal.uf2`。旧 v7 只有日志，不能执行管理命令。保留 `releases/v7/` 内的实测可用基线，便于回退。
+1. 给接收器刷入 `firmware/nicenano-ble-usb-diagnostic-v8.2-web-xtal.uf2`。旧 v7 只有日志，不能执行管理命令。保留 `releases/v7/` 内的实测可用基线，便于回退。
 2. macOS 可双击 `start-web.command` 启动；也可在仓库目录运行 `python3 -m http.server 8857 --bind 127.0.0.1 --directory web`。
 3. 用 Chrome / Edge 打开 `http://127.0.0.1:8857`，点击“连接 USB 接收器”，选择对应串口。浏览器授权由用户操作。
 4. 页面可查看 BLE / USB 状态及报告计数、扫描附近 BLE HID 设备、连接选择的设备、断开、恢复自动连接和清除接收器绑定。清除前有二次确认。
@@ -152,3 +152,9 @@ v8 实机已验证 `@status`、`@scan`、`@devices`、`@resume` 的双向协议�
 ### v8.1 实机验收记录
 
 已确认加密及 HID 初始化成功，BLE=1、USB=1、secure=1、errors=0，用户确认可以正常使用。`@status`、`@devices`、`@scan`、`@resume` 已通过实际串口往返验证，扫描列表能返回 wenwan。网页未连接界面已通过浏览器布局检查；浏览器原生串口授权需要在 Chrome/Edge 中由用户选择设备。未为测试而清除现有绑定或断开正在使用的键盘，清除/换设备流程仍待专项验收。首轮 GitHub Actions（6d98f5e）已通过，后续修复的云端同步单独核对。
+
+### v8.2 清除/重连循环修正
+
+用户日志显示加密和 HID 初始化成功后立即出现 `Report stream lost`，随后由接收器主动断开（原因 22/0x16）。Zephyr 在调用应用断连回调前清理 volatile 订阅；此前清理回调依据尚未清零的 ready 状态误报故障，故障标记又遗留到下一条连接，造成循环。
+
+v8.2 在订阅移除时核对实际连接状态，仅在仍连接时报告异常；断连回调清除旧连接故障。保留实际报告丢失时释放按键并重连的保护。管理协议仍为 1，原网页可继续使用，升级通常保留绑定。新固件需实机验证清除后重连及普通断开后恢复。

@@ -355,11 +355,16 @@ K_THREAD_DEFINE(input_thread, 2048, input_worker, NULL, NULL, NULL, 7, 0, 0);
 static uint8_t input_notify(struct bt_conn *conn, struct bt_gatt_subscribe_params *sub,
                            const void *data, uint16_t len)
 {
-    ARG_UNUSED(conn);
     struct report *r=CONTAINER_OF(sub, struct report, sub);
     if (!data) {
         sub->value_handle=0;
-        if (atomic_get(&ready)) {
+        /* Zephyr removes volatile subscriptions before calling disconnected().
+         * ready/link_up still describe the old link during that cleanup. Only
+         * losing a subscription on an actually connected link is a fault. */
+        struct bt_conn_info info;
+        if (conn && atomic_get(&ready) && !bt_conn_get_info(conn, &info) &&
+            info.state==BT_CONN_STATE_CONNECTED) {
+            LOG_WRN("Input subscription lost on active link: ID=%u", r->id);
             atomic_set(&queue_fault, 1); atomic_set(&release_needed, 1);
         }
         return BT_GATT_ITER_STOP;
@@ -505,6 +510,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
     ARG_UNUSED(conn);
     atomic_clear(&ready); atomic_clear(&link_up); atomic_clear(&secure);
+    /* A report fault belongs to the retired link, never its replacement. */
+    atomic_clear(&queue_fault);
     atomic_set(&release_needed, 1);
     k_msgq_purge(&output_queue);
     op_result=-ENOTCONN; k_sem_give(&op_done); k_sem_give(&link_event);
@@ -603,7 +610,7 @@ static void clear_pairing(void)
 
 static void control_status(void)
 {
-    printk("@bridge {\"event\":\"status\",\"protocol\":1,\"version\":\"v8.1-web\",\"ble\":%d,\"usb\":%d,\"secure\":%d,\"bonded\":%d,\"paused\":%d,\"rx\":%ld,\"tx\":%ld,\"errors\":%ld}\n",
+    printk("@bridge {\"event\":\"status\",\"protocol\":1,\"version\":\"v8.2-web\",\"ble\":%d,\"usb\":%d,\"secure\":%d,\"bonded\":%d,\"paused\":%d,\"rx\":%ld,\"tx\":%ld,\"errors\":%ld}\n",
            (int)atomic_get(&ready),(int)atomic_get(&usb_mounted),
            (int)atomic_get(&secure),has_bond,paused,
            (long)atomic_get(&ble_reports),(long)atomic_get(&usb_reports),(long)atomic_get(&usb_failures));
@@ -744,7 +751,7 @@ int main(void)
         if (hid_map_parse(report_map, map_len, &map_info)) return 0;
     }
     if ((err=start_usb())) { LOG_ERR("USB init %d", err); return 0; }
-    LOG_INF("Bridge v8.1-web starting; expected peer name '%s'", CONFIG_BRIDGE_PEER_NAME);
+    LOG_INF("Bridge v8.2-web starting; expected peer name '%s'", CONFIG_BRIDGE_PEER_NAME);
     uint32_t reset_cause=0;
     if (!hwinfo_get_reset_cause(&reset_cause)) {
         LOG_INF("Reset cause mask=%08x", reset_cause);
