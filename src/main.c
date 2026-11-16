@@ -575,8 +575,7 @@ static void scan_found(const struct bt_le_scan_recv_info *info, struct net_buf_s
     if (has_bond) {
         if (bt_addr_le_cmp(info->addr, &bonded_addr)) return;
     } else {
-        struct advertisement a={0};
-        bt_data_parse(ad, parse_ad, &a);
+        struct advertisement a=observed;
         /* ZMK puts the name in the scan response; appearance/service may be
          * in a separate advertising packet. An exact name is sufficient here. */
         if (strlen(CONFIG_BRIDGE_PEER_NAME) ? !a.name : !a.hid) return;
@@ -604,7 +603,7 @@ static void clear_pairing(void)
 
 static void control_status(void)
 {
-    printk("@bridge {\"event\":\"status\",\"protocol\":1,\"version\":\"v8-web\",\"ble\":%d,\"usb\":%d,\"secure\":%d,\"bonded\":%d,\"paused\":%d,\"rx\":%ld,\"tx\":%ld,\"errors\":%ld}\n",
+    printk("@bridge {\"event\":\"status\",\"protocol\":1,\"version\":\"v8.1-web\",\"ble\":%d,\"usb\":%d,\"secure\":%d,\"bonded\":%d,\"paused\":%d,\"rx\":%ld,\"tx\":%ld,\"errors\":%ld}\n",
            (int)atomic_get(&ready),(int)atomic_get(&usb_mounted),
            (int)atomic_get(&secure),has_bond,paused,
            (long)atomic_get(&ble_reports),(long)atomic_get(&usb_reports),(long)atomic_get(&usb_failures));
@@ -745,7 +744,7 @@ int main(void)
         if (hid_map_parse(report_map, map_len, &map_info)) return 0;
     }
     if ((err=start_usb())) { LOG_ERR("USB init %d", err); return 0; }
-    LOG_INF("Bridge v8-web starting; expected peer name '%s'", CONFIG_BRIDGE_PEER_NAME);
+    LOG_INF("Bridge v8.1-web starting; expected peer name '%s'", CONFIG_BRIDGE_PEER_NAME);
     uint32_t reset_cause=0;
     if (!hwinfo_get_reset_cause(&reset_cause)) {
         LOG_INF("Reset cause mask=%08x", reset_cause);
@@ -818,7 +817,11 @@ int main(void)
                 k_sleep(K_MSEC(20)); continue;
             }
             err=bt_conn_set_security(peer, BT_SECURITY_L2);
-            if (err) { LOG_ERR("Security request %d", err); bt_conn_disconnect(peer, BT_HCI_ERR_AUTH_FAIL); }
+            if (err && err!=-EBUSY && err!=-EALREADY && err!=-EINPROGRESS) {
+                LOG_ERR("Security request %d", err);
+                if(err==-EKEYREVOKED || err==-EKEYREJECTED) atomic_set(&stale_bond,1);
+                bt_conn_disconnect(peer, BT_HCI_ERR_AUTH_FAIL);
+            }
             k_sem_take(&link_event, K_MSEC(50));
             continue;
         }
